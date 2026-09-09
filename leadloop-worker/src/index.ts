@@ -69,8 +69,16 @@ export default {
         await processFollowUpDraft(supabase, env, message.body)
         message.ack()
       } catch (err) {
-        console.error('Queue job failed:', err)
-        message.retry()
+        // The reason goes in as text: Workers Logs has kept only the stack
+        // frames of a logged Error object, dropping its message.
+        const reason = err instanceof Error ? err.message : String(err)
+        console.error(
+          `Queue job failed (attempt ${message.attempts}) for follow-up ${message.body.scheduledFollowUpId}: ${reason}`,
+          err
+        )
+        // Linear backoff between attempts so a transient Gmail/Google
+        // outage isn't hammered with back-to-back retries.
+        message.retry({ delaySeconds: 30 * message.attempts })
       }
     }
   },

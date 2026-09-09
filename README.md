@@ -131,8 +131,9 @@ Note the Worker URL (e.g. `https://leadloop-worker.YOUR_SUBDOMAIN.workers.dev`).
 4. Under **Authorized redirect URIs**, add the Supabase callback URL from step 2.
 5. Under **Authorized JavaScript origins**, add your dashboard URL (e.g. `https://leadloop-dashboard.YOUR_SUBDOMAIN.workers.dev`).
 6. Copy the **Client ID** and **Client Secret** — these go into both Supabase (step 2) and the Worker secrets (step 3).
+7. **Publish the app.** On the OAuth consent screen, set the publishing status to **In production** (or use the **Internal** user type if the project belongs to your Google Workspace org). While the status is **Testing**, Google expires every refresh token after **7 days** — LeadLoop's background drafting then dies a week after each sign-in with `invalid_grant`, and you have to sign in again. Publishing an unverified app with Gmail scopes just adds an "unverified app" screen at sign-in; it does not need Google's verification review for a personal or small-team deployment.
 
-If your OAuth app is in **Testing** mode, add your email as a test user.
+If you must stay in **Testing** mode for now, add your email as a test user and expect to reconnect Gmail weekly.
 
 ### 5. Dashboard
 
@@ -332,6 +333,15 @@ cd leadloop-worker && npm test
 4. **The engine**: A cron job checks every 10 minutes for due steps and queues draft creation (the dashboard/MCP "Draft now" enqueues the same jobs immediately). The consumer atomically leases each row, re-syncs the thread, and reconciles first: a reply dismisses the follow-up and marks the run `replied`; a previous draft sent manually is marked `superseded` and the cadence re-anchors on the real send time; an unsent previous draft defers the step. Otherwise it renders the step body with the run's variables, creates a threaded Gmail draft, advances the step, and schedules the next one. Sending happens only via the explicit "Send LeadLoop drafts" action (dashboard or MCP), which sends the exact stored draft ids and reschedules the next step from the actual send. Runs complete when steps run out.
 5. **Examples**: Saving a run copies the full conversation into one `outreach_examples` row (subject, rendered thread text, tags, the winning sequence). Self-contained — it survives thread deletion.
 6. **Security**: All tables use Row Level Security. The add-on authenticates via a shared API key + user email header. The dashboard uses Supabase JWT auth. The MCP endpoint uses its own bearer API key + user email header, and every tool query is scoped to that user.
+7. **Gmail credential loss**: Every Gmail call goes through one token exchange (`getAccessToken`). If Google answers `invalid_grant` — the refresh token was revoked, invalidated by a password change, or hit the 7-day Testing-mode expiry — the Worker nulls the profile's token and records the reason in `profiles.gmail_auth_error`. From then on the cron sweep skips that user's due follow-ups (they stay `pending`), the queue consumer does not retry, and the dashboard shows a banner with the reason and a **Reconnect Gmail** button. Signing in again stores a fresh token, clears the error, and the backlog drafts on the next sweeps (50 per 10 minutes). Only Google-side 5xx/429 failures are retried, with backoff.
+
+## Troubleshooting
+
+**"Gmail is disconnected" banner / `Token refresh failed (400 invalid_grant)` in Worker logs.** Google no longer accepts the stored refresh token. Click **Reconnect Gmail** (or sign out and back in). If it recurs about 7 days after every sign-in, the OAuth consent screen is still in **Testing** — see step 7 of the Google OAuth setup.
+
+**`Token refresh failed (401 invalid_client)` / `unauthorized_client`.** The Worker's `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` secrets don't match the OAuth client configured in Supabase Auth. Re-run `wrangler secret put` with the right values; no re-login needed.
+
+**Follow-ups are due but nothing is drafting.** Check the banner/Settings first. Then, in Workers observability, filter `leadloop-worker` logs for `Queue job failed` or `paused for user` — the message includes Google's error code and description.
 
 ## License
 

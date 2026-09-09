@@ -11,7 +11,9 @@ export async function GET(request: Request) {
     const { data, error } = await supabase.auth.exchangeCodeForSession(code);
 
     if (!error && data.session) {
-      // Store the Google refresh token for background Gmail API access
+      // Store the Google refresh token for background Gmail API access.
+      // A fresh grant also clears any disconnect the Worker recorded when
+      // the previous token died.
       const refreshToken = data.session.provider_refresh_token;
       if (refreshToken) {
         await supabase
@@ -21,6 +23,8 @@ export async function GET(request: Request) {
             gmail_token_expires_at: new Date(
               Date.now() + (data.session.expires_in ?? 3600) * 1000
             ).toISOString(),
+            gmail_auth_error: null,
+            gmail_auth_error_at: null,
           })
           .eq("id", data.session.user.id);
       }

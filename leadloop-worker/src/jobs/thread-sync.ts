@@ -1,10 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import {
-  getThread,
-  extractBody,
-  getHeader,
-  refreshAccessToken,
-} from '../services/gmail'
+import { getThread, extractBody, getHeader } from '../services/gmail'
+import { getAccessToken } from '../services/gmail-credentials'
 
 interface SyncEnv {
   GOOGLE_CLIENT_ID: string
@@ -27,16 +23,9 @@ export async function syncThreadFromGmail(
     userEmail: string
   }
 ): Promise<void> {
-  const { access_token } = await refreshAccessToken(
-    env.GOOGLE_CLIENT_ID,
-    env.GOOGLE_CLIENT_SECRET,
-    opts.refreshToken
-  )
+  const accessToken = await getAccessToken(supabase, env, opts.userId, opts.refreshToken)
 
-  const gmailThread = await getThread(
-    { accessToken: access_token },
-    opts.gmailThreadId
-  )
+  const gmailThread = await getThread({ accessToken }, opts.gmailThreadId)
 
   const normalizedEmail = opts.userEmail.toLowerCase()
 

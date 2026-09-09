@@ -1,6 +1,12 @@
 import { Buffer } from 'node:buffer'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { buildRawEmail, extractBody, sendDraft } from './gmail'
+import {
+  GoogleTokenError,
+  buildRawEmail,
+  extractBody,
+  refreshAccessToken,
+  sendDraft,
+} from './gmail'
 
 const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
 
@@ -106,17 +112,83 @@ describe('buildRawEmail', () => {
   })
 })
 
-describe('sendDraft', () => {
+function stubFetch(status: number, body: unknown) {
+  const calls: Array<{ url: string; init: RequestInit }> = []
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+    calls.push({ url, init })
+    const text = typeof body === 'string' ? body : JSON.stringify(body)
+    return new Response(text, { status })
+  })
+  return calls
+}
+
+describe('refreshAccessToken', () => {
   afterEach(() => vi.unstubAllGlobals())
 
-  function stubFetch(status: number, body: unknown) {
-    const calls: Array<{ url: string; init: RequestInit }> = []
-    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
-      calls.push({ url, init })
-      return new Response(JSON.stringify(body), { status })
-    })
-    return calls
+  const refresh = () => refreshAccessToken('client-id', 'client-secret', 'rt-1')
+
+  async function failure(status: number, body: unknown): Promise<GoogleTokenError> {
+    stubFetch(status, body)
+    try {
+      await refresh()
+    } catch (err) {
+      if (err instanceof GoogleTokenError) return err
+      throw err
+    }
+    throw new Error('expected refreshAccessToken to throw')
   }
+
+  it('posts a refresh_token grant and returns the token payload', async () => {
+    const calls = stubFetch(200, { access_token: 'at-1', expires_in: 3599 })
+    expect(await refresh()).toEqual({ access_token: 'at-1', expires_in: 3599 })
+    expect(calls[0].url).toBe('https://oauth2.googleapis.com/token')
+    expect(String(calls[0].init.body)).toContain('grant_type=refresh_token')
+  })
+
+  it('classifies invalid_grant as a dead token: needs re-auth, never retried', async () => {
+    const err = await failure(400, {
+      error: 'invalid_grant',
+      error_description: 'Token has been expired or revoked.',
+    })
+    expect(err.code).toBe('invalid_grant')
+    expect(err.status).toBe(400)
+    expect(err.needsReauth).toBe(true)
+    expect(err.retryable).toBe(false)
+    // One line, with Google's code and description: this is what the logs
+    // and the Settings page get to show.
+    expect(err.message).toBe(
+      'Token refresh failed (400 invalid_grant): Token has been expired or revoked.'
+    )
+    expect(err.message).not.toContain('\n')
+  })
+
+  it('treats a misconfigured client as our problem, not the user token', async () => {
+    const err = await failure(401, {
+      error: 'invalid_client',
+      error_description: 'The OAuth client was not found.',
+    })
+    expect(err.needsReauth).toBe(false)
+    expect(err.retryable).toBe(false)
+  })
+
+  it('marks Google-side failures retryable, even when the body is not JSON', async () => {
+    const err = await failure(503, '<html>\n  <body>Service Unavailable</body>\n</html>')
+    expect(err.code).toBe('http_503')
+    expect(err.retryable).toBe(true)
+    expect(err.needsReauth).toBe(false)
+    expect(err.message).toBe(
+      'Token refresh failed (503 http_503): <html> <body>Service Unavailable</body> </html>'
+    )
+  })
+
+  it('marks rate limiting retryable', async () => {
+    const err = await failure(429, { error: 'rate_limit_exceeded' })
+    expect(err.retryable).toBe(true)
+  })
+})
+
+describe('sendDraft', () => {
+  afterEach(() => vi.unstubAllGlobals())
 
   it('POSTs exactly the stored draft id to drafts.send and returns the sent message', async () => {
     const calls = stubFetch(200, { id: 'msg-9', threadId: 'thr-3' })

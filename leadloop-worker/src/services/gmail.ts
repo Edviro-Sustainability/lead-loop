@@ -31,7 +31,41 @@ interface GmailMessage {
 }
 
 /**
+ * Google's token endpoint refused to mint an access token. `code` is the
+ * OAuth error Google returned (`invalid_grant`, `invalid_client`, ...).
+ *
+ * Callers must not treat every failure alike: only server-side trouble
+ * is worth a retry. `invalid_grant` means the refresh token itself is
+ * dead — revoked, invalidated by a password change, or expired (OAuth
+ * apps still in "Testing" publishing status expire refresh tokens after
+ * 7 days) — and only a fresh sign-in can replace it.
+ */
+export class GoogleTokenError extends Error {
+  readonly status: number
+  readonly code: string
+
+  constructor(status: number, code: string, description: string) {
+    // Keep it on one line: log pipelines index the first line of a message.
+    super(`Token refresh failed (${status} ${code}): ${description.replace(/\s+/g, ' ').trim()}`)
+    this.name = 'GoogleTokenError'
+    this.status = status
+    this.code = code
+  }
+
+  /** Google's side is having trouble; the same request may succeed shortly. */
+  get retryable(): boolean {
+    return this.status >= 500 || this.status === 429
+  }
+
+  /** The stored refresh token is dead; the user has to sign in again. */
+  get needsReauth(): boolean {
+    return this.code === 'invalid_grant'
+  }
+}
+
+/**
  * Refresh a Google OAuth access token using a stored refresh token.
+ * Throws `GoogleTokenError` when Google rejects the request.
  */
 export async function refreshAccessToken(
   clientId: string,
@@ -50,8 +84,17 @@ export async function refreshAccessToken(
   })
 
   if (!response.ok) {
-    const err = await response.text()
-    throw new Error(`Token refresh failed: ${err}`)
+    const text = await response.text()
+    let code = `http_${response.status}`
+    let description = text.slice(0, 300)
+    try {
+      const body = JSON.parse(text) as { error?: string; error_description?: string }
+      if (typeof body.error === 'string') code = body.error
+      if (typeof body.error_description === 'string') description = body.error_description
+    } catch {
+      // Not JSON (e.g. an HTML 5xx page); the raw excerpt is the best we have.
+    }
+    throw new GoogleTokenError(response.status, code, description)
   }
 
   return response.json()

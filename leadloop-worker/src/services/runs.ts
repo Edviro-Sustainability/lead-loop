@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { refreshAccessToken, findLatestSentThread, sendDraft } from './gmail'
+import { findLatestSentThread, sendDraft } from './gmail'
+import { getAccessToken } from './gmail-credentials'
 import { syncThreadFromGmail } from '../jobs/thread-sync'
 import { extractVariables } from '../lib/render'
 import type { FollowUpDraftMessage } from '../lib/types'
@@ -117,7 +118,10 @@ export async function resolveDraftRow(
 /**
  * Find all scheduled follow-ups that are due now. Called by the cron.
  * Includes `drafting` rows whose lease expired (a Worker died mid-draft)
- * so they are re-swept instead of stranded.
+ * so they are re-swept instead of stranded. Rows whose user has no Gmail
+ * credentials on file are left alone: nothing can be drafted for them
+ * until the user signs back in, and re-queueing them every tick only
+ * makes noise. They stay pending and are picked up once reconnected.
  */
 export async function getDueFollowUps(
   supabase: SupabaseClient
@@ -126,9 +130,10 @@ export async function getDueFollowUps(
 
   const { data, error } = await supabase
     .from('scheduled_follow_ups')
-    .select('id, thread_id, user_id')
+    .select('id, thread_id, user_id, profiles!inner(id)')
     .or(`status.eq.pending,and(status.eq.drafting,lease_expires_at.lt.${now})`)
     .lte('scheduled_for', now)
+    .not('profiles.gmail_refresh_token', 'is', null)
     .limit(50)
 
   if (error) {
@@ -136,7 +141,7 @@ export async function getDueFollowUps(
     return []
   }
 
-  return data ?? []
+  return (data ?? []).map(({ id, thread_id, user_id }) => ({ id, thread_id, user_id }))
 }
 
 /**
@@ -234,15 +239,11 @@ export async function startSequence(
     throw new Error('No Gmail credentials on file — sign in on the dashboard first')
   }
 
-  const { access_token } = await refreshAccessToken(
-    env.GOOGLE_CLIENT_ID,
-    env.GOOGLE_CLIENT_SECRET,
-    profile.gmail_refresh_token
-  )
+  const accessToken = await getAccessToken(supabase, env, userId, profile.gmail_refresh_token)
 
   let gmailThreadId = opts.gmailThreadId
   if (!gmailThreadId) {
-    const found = await findLatestSentThread({ accessToken: access_token }, opts.recipientEmail!)
+    const found = await findLatestSentThread({ accessToken }, opts.recipientEmail!)
     if (!found) throw new Error(`No sent thread found to ${opts.recipientEmail}`)
     gmailThreadId = found
   }
@@ -379,7 +380,7 @@ export async function draftNow(
   if (ids.length === 0) throw new Error('run_ids must not be empty')
   if (ids.length > 50) throw new Error('At most 50 runs per draft-now call')
 
-  const [runsRes, rowsRes] = await Promise.all([
+  const [runsRes, rowsRes, profileRes] = await Promise.all([
     supabase.from('watched_threads').select('id, status').eq('user_id', userId).in('id', ids),
     supabase
       .from('scheduled_follow_ups')
@@ -387,9 +388,15 @@ export async function draftNow(
       .eq('user_id', userId)
       .in('thread_id', ids)
       .in('status', ['pending', 'drafting', ...OUTSTANDING_DRAFT_STATUSES]),
+    supabase.from('profiles').select('gmail_refresh_token').eq('id', userId).single(),
   ])
   if (runsRes.error) throw new Error(runsRes.error.message)
   if (rowsRes.error) throw new Error(rowsRes.error.message)
+  // The consumer would only no-op without credentials; say so up front
+  // instead of reporting "queued" for drafts that can never appear.
+  if (!profileRes.data?.gmail_refresh_token) {
+    throw new Error('No Gmail credentials on file — sign in on the dashboard first')
+  }
 
   const queued: string[] = []
   const skipped: DraftNowResult['skipped'] = []
@@ -467,12 +474,9 @@ export async function sendLeadLoopDrafts(
     throw new Error('No Gmail credentials on file — sign in on the dashboard first')
   }
 
-  const { access_token } = await refreshAccessToken(
-    env.GOOGLE_CLIENT_ID,
-    env.GOOGLE_CLIENT_SECRET,
-    profile.gmail_refresh_token
-  )
-  const tokens = { accessToken: access_token }
+  const tokens = {
+    accessToken: await getAccessToken(supabase, env, userId, profile.gmail_refresh_token),
+  }
 
   const results: SendDraftsResult['results'] = []
   for (const id of ids) {

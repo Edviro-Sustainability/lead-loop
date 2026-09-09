@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { FollowUpDraftMessage } from '../lib/types'
-import { refreshAccessToken, createDraft } from '../services/gmail'
+import { GoogleTokenError, createDraft } from '../services/gmail'
+import { getAccessToken } from '../services/gmail-credentials'
 import {
   scheduleStep,
   bareEmail,
@@ -23,7 +24,9 @@ interface DraftEnv {
  * current step of the sequence with the run's stored {{variables}}
  * filled in. Called by the follow-up-draft queue consumer (fed by the
  * cron sweep and by explicit Draft-now bumps); throwing lets the queue
- * retry (e.g. transient Gmail failures).
+ * retry (e.g. transient Gmail failures). Failures that a retry cannot
+ * fix — Google rejecting our credentials — return instead, leaving the
+ * row pending for whenever a human has repaired the credentials.
  */
 export async function processFollowUpDraft(
   supabase: SupabaseClient,
@@ -203,14 +206,15 @@ export async function processFollowUpDraft(
     const body = renderTemplate(step.body, variables)
     const subject = `Re: ${thread.subject ?? ''}`
 
-    const { access_token } = await refreshAccessToken(
-      env.GOOGLE_CLIENT_ID,
-      env.GOOGLE_CLIENT_SECRET,
+    const accessToken = await getAccessToken(
+      supabase,
+      env,
+      msg.userId,
       profile.gmail_refresh_token
     )
 
     const draft = await createDraft(
-      { accessToken: access_token },
+      { accessToken },
       lastSent.to_email,
       subject,
       body,
@@ -262,6 +266,18 @@ export async function processFollowUpDraft(
       .update({ status: 'pending', lease_expires_at: null })
       .eq('id', msg.scheduledFollowUpId)
       .eq('status', 'drafting')
+
+    // Google refused our credentials (dead refresh token, misconfigured
+    // client). No retry can change that answer, and with the cron
+    // re-sweeping every due row each tick, retrying turns one dead token
+    // into a permanent failure storm. The row stays pending; getAccessToken
+    // has already disconnected the profile if the grant itself is dead.
+    if (err instanceof GoogleTokenError && !err.retryable) {
+      console.error(
+        `Follow-up ${msg.scheduledFollowUpId} paused for user ${msg.userId}: ${err.message}`
+      )
+      return
+    }
     throw err
   }
 }

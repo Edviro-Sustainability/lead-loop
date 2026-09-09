@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { Sidebar } from "@/components/sidebar";
 import { UserNav } from "@/components/user-nav";
+import { GmailDisconnectedBanner } from "@/components/gmail-disconnected-banner";
 
 export default async function DashboardLayout({
   children,
@@ -17,9 +18,14 @@ export default async function DashboardLayout({
 
   const { data: profile } = await supabase
     .from("profiles")
-    .select("display_name, gmail_email")
+    .select(
+      "display_name, gmail_email, gmail_refresh_token, gmail_auth_error, gmail_auth_error_at"
+    )
     .eq("id", user.id)
     .single();
+
+  // Server-side only: the token never reaches the client, just this boolean.
+  const gmailConnected = !!profile?.gmail_refresh_token;
 
   return (
     <div className="flex h-full">
@@ -31,6 +37,12 @@ export default async function DashboardLayout({
             displayName={profile?.display_name ?? null}
           />
         </header>
+        {!gmailConnected && (
+          <GmailDisconnectedBanner
+            reason={profile?.gmail_auth_error ?? null}
+            disconnectedAt={profile?.gmail_auth_error_at ?? null}
+          />
+        )}
         <main className="flex-1 overflow-y-auto">{children}</main>
       </div>
     </div>
